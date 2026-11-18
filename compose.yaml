@@ -1,0 +1,50 @@
+# Start everything:     docker compose up -d --build
+# Then, locally:        uv run python -m src.tui          (connects to http://127.0.0.1:8000)
+# Inject a demo email:  uv run python scripts/inject.py
+name: inbox-triage
+
+services:
+  db:
+    image: docker.io/library/postgres:18.7-trixie
+    environment:
+      POSTGRES_USER: triage
+      POSTGRES_PASSWORD: triage
+      POSTGRES_DB: triage
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U triage -d triage"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  mock:
+    build: { context: ., target: mock }
+    environment:  # required, no fallback: tokens come only from .env / the environment
+      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env}
+      WRITE_TOKEN: ${WRITE_TOKEN:?set WRITE_TOKEN in .env}
+    ports: ["127.0.0.1:8099:8099"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/docs')"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: { context: ., target: backend }
+    env_file: .env            # OpenRouter key, tokens, bootstrap user
+    environment:
+      API_BASE_URL: http://mock:8099
+      DATABASE_URL: postgresql://triage:triage@db:5432/triage
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+      mock: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
