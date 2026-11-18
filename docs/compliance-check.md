@@ -14,7 +14,7 @@ Checked against the repo `README.md` (requirements, rules, deliverables) and the
 | 5a | Spam path never holds write credentials | ✅ | workers have no API client; the poller has a read-only client; `write_token()` has one call site (`pipeline.approve`) |
 | 5b | Tokens from the environment, never hardcoded | ✅ *(fixed during this check)* | `compose.yaml` fell back to dev tokens → now `${VAR:?}` required from `.env`; OpenRouter key only in `.env` (gitignored) |
 | 5c | Write scope used only after approval | ✅ | write client built inside `approve()` after the DB transition; caveat: the token sits in the backend process env (documented limitation) |
-| 6 | Verify your work | ✅ | 142 tests; `scripts/evaluate.py` live eval; headless TUI + Chrome checks; manual draft review; CodeRabbit review on PR #1 (23/24 findings fixed, re-tested live) |
+| 6 | Verify your work | ✅ | 154 tests; `scripts/evaluate.py` live eval; headless TUI + Chrome checks; manual draft review; CodeRabbit review on PR #1, 2 rounds (28/29 findings fixed, re-tested live) |
 | 7 | README section the client could read | ✅ *(written during this check)* | `README.md` → "Inbox Triage: what it does", how to run, proudest decision |
 | — | Stub contract (`classify_email`, `plan_actions`, `execute`, `triage_inbox`, `TriageClient`) | ✅ | signatures kept; `plan_actions`/`get_inbox` only gained optional params |
 

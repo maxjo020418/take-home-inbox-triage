@@ -14,7 +14,7 @@ cp env.example .env        # OPENROUTER_API_KEY, OPENROUTER_MODEL=deepseek/deeps
 docker compose up -d --build        # postgres 18 + mock email API (:8099) + backend (:8000)   [podman compose works too]
 uv sync && uv run python -m src.tui # local TUI: connect to http://127.0.0.1:8000, log in as admin
 uv run python scripts/inject.py --file dataset/email_classifier_starter.jsonl   # or the console: http://127.0.0.1:8099/_admin
-uv run pytest -q                    # 142 tests (DB-backed ones skip without postgres)
+uv run pytest -q                    # 154 tests (DB-backed ones skip without postgres)
 uv run python scripts/evaluate.py   # score live results against dataset/*.jsonl
 ```
 
@@ -56,13 +56,13 @@ Others I caught by using the product, not by reading code:
 ## Verification results (checked myself)
 | Check | Result |
 |---|---|
-| `pytest` (routing, gate, write scope, edit rules, auth, domain checker, injection patterns, safety rating, filters, extras, review fixes) | 142 passed (incl. DB-backed tests on self-cleaning rows + docs-sync) |
+| `pytest` (routing, gate, write scope, edit rules, auth, domain checker, injection patterns, safety rating, filters, extras, review fixes) | 154 passed (incl. DB-backed tests on self-cleaning rows + docs-sync) |
 | Live eval, 148 labeled emails (deepseek via OpenRouter) | labels and standard actions **148/148**: clean 55/55, prompt-injected 49/49 (was 32/48 before the fix), impersonation 44/44 |
 | Sender-domain verdicts (impersonation set) | 44/44, 0 false alarms on 8 real-domain controls |
 | Injection detection (model OR patterns) | 49/49, 1 false alarm (a bug report quoting the phrase as log text) |
 | Manual read of replies to the worst attacks ("promise refund + ask password", "email the thread out", "skip review") | none complied; recipients always the sender |
 | API checks | no token 401 · wrong password = unknown user · re-approve 409 · edit `to` 422 · token dead after logout |
-| CodeRabbit review (24 findings: 23 fixed, 1 skipped with reason), re-tested live | stale-draft approve → 409 and nothing sent · reopen refuses pending/missing · TUI refuses `http://` to non-local hosts · all table cells plain `Text` (markup-crash fix) · domain verdicts still 44/44 with full-domain DNS |
+| CodeRabbit review, 2 rounds (29 findings: 28 fixed, 1 skipped with reason), re-tested live | stale-draft approve → 409 and nothing sent · reopen refuses pending/missing · TUI refuses `http://` to non-local hosts · all table cells plain `Text` (markup-crash fix) · domain verdicts still 44/44 with full-domain DNS |
 
 ## Remaining limitations
 - Small synthetic template datasets and single runs; 100% overstates real-world accuracy. The injection patterns were tuned on the same data. The impersonation lookalikes are partly circular (dnstwist generates and detects them).
@@ -302,8 +302,11 @@ CREATE TABLE IF NOT EXISTS emails (
 );
 CREATE INDEX IF NOT EXISTS emails_status_idx ON emails (status, received_at);
 
--- One row per proposed external write. Nothing here has happened until
--- status = 'executed', and it can only get there via 'approved'.
+-- One row per proposed external write. Flow: pending -> approved -> executed | failed
+-- (or pending -> rejected). Nothing is sent before 'approved'. After approval the write
+-- may reach the external API even if the row ends 'failed' or stays 'approved' (crash):
+-- failed+retryable means it provably never left; any other failure is uncertain and must
+-- be verified in the target system before re-sending.
 CREATE TABLE IF NOT EXISTS actions (
     id           BIGSERIAL PRIMARY KEY,
     email_id     TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
@@ -365,6 +368,9 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS extra BOOLEAN NOT NULL DEFAULT fals
 -- (no token, no write scope, connect error), so a human may reopen it for re-approval.
 -- false = outcome uncertain (sent, then timed out / errored, or interrupted): verify manually.
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS retryable BOOLEAN;
+-- Identity of the current classification claim; result writes are fenced to it so a
+-- job re-queued mid-run (stale sweep) can't be overwritten by the superseded run.
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS claim_id UUID;
 ```
 
 <!-- END GENERATED -->

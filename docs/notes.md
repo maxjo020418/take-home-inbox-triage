@@ -214,3 +214,9 @@ was pinned as the shared contract.
   org domain); Unicode domains are normalized to A-labels before lookalike matching; `safe` requires every check to have run; the mock
   shows back-dated injected mail to incremental polls (arrival cursor); compose resolves tokens identically for mock and backend.
 - **Wording:** the README now limits the approval guarantee to outbound actions and discloses that email content goes to the LLM provider.
+
+**Round 2 (after the fixes were pushed, 5 findings, all fixed):** classification results are fenced to the claim that produced them
+(`emails.claim_id`, a new UUID per claim, cleared by the stale sweep), so a run re-queued mid-flight can't overwrite or duplicate a newer
+claim's actions. Reopen locks the email before its status check (same serialization as settlement). The TUI's refresh no-ops if the client
+is gone. The client rejects any non-2xx and validates the login/dashboard shapes (`BackendError` instead of crashing the worker). The
+schema comment no longer implies "not executed = not sent".
