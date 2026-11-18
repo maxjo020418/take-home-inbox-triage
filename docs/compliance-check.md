@@ -10,11 +10,11 @@ Checked against the repo `README.md` (requirements, rules, deliverables) and the
 | 1 | Ingest from `GET /inbox` | ✅ | `pipeline.poll_once` (read-only client, `since` cursor + id dedupe); 148 emails ingested |
 | 2 | Exactly one of 4 labels | ✅ | `TriageOutput.label: Literal[...]` (invalid output fails validation and is retried); eval 148/148 |
 | 3 | Routing table (billing→reply, bug→Slack `#engineering`, sales→reply+CRM, spam→log & drop) | ✅ | `triage_skill.ROUTING` matches the table exactly (`test_routing_table_matches_readme`); spam → `dropped` + audit event. *Addition:* optional, separately approved `+extra` actions (never for spam or injected mail) |
-| 4 | HITL gate: no external action without explicit approval | ✅ | `execute()` requires `approved is True`; the only executor is `POST /actions/{id}/approve` (authenticated); atomic `pending→approved`, re-approve 409; tests for False/None/1/"yes" |
+| 4 | HITL gate: no external action without explicit approval | ✅ | `execute()` requires `approved is True`; the only executor is `POST /actions/{id}/approve` (authenticated); row-locked `pending→approved` bound to the viewed draft's digest (stale → 409), re-approve 409; uncertain send failures never auto-replayed; tests for False/None/1/"yes" |
 | 5a | Spam path never holds write credentials | ✅ | workers have no API client; the poller has a read-only client; `write_token()` has one call site (`pipeline.approve`) |
 | 5b | Tokens from the environment, never hardcoded | ✅ *(fixed during this check)* | `compose.yaml` fell back to dev tokens → now `${VAR:?}` required from `.env`; OpenRouter key only in `.env` (gitignored) |
 | 5c | Write scope used only after approval | ✅ | write client built inside `approve()` after the DB transition; caveat: the token sits in the backend process env (documented limitation) |
-| 6 | Verify your work | ✅ | 84 tests; `scripts/evaluate.py` live eval; headless TUI + Chrome checks; manual draft review |
+| 6 | Verify your work | ✅ | 142 tests; `scripts/evaluate.py` live eval; headless TUI + Chrome checks; manual draft review; CodeRabbit review on PR #1 (23/24 findings fixed, re-tested live) |
 | 7 | README section the client could read | ✅ *(written during this check)* | `README.md` → "Inbox Triage: what it does", how to run, proudest decision |
 | — | Stub contract (`classify_email`, `plan_actions`, `execute`, `triage_inbox`, `TriageClient`) | ✅ | signatures kept; `plan_actions`/`get_inbox` only gained optional params |
 
@@ -40,5 +40,5 @@ Checked against the repo `README.md` (requirements, rules, deliverables) and the
 ## Open items (owner: you)
 1. Commit + push (I haven't, since that's outward-facing). Make sure `.env` stays untracked (it is gitignored).
 2. Fill in **Name**; sanity-check the log's narrative.
-3. Before the demo: `podman compose down -v && up -d --build` for a clean DB, then inject a few representative emails.
+3. Before the demo: `podman compose down -v && podman compose up -d --build` for a clean DB, then inject a few representative emails.
 4. Decide whether to rehearse on Windows.

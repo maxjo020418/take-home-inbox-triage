@@ -191,3 +191,26 @@ check plus how many others are flagged (`⚠ injection +1`). The DNS posture is 
   (4/4 on retry). Gap: a reviewer can reject an action but can't add a missing one.
 - Eval run 4 (140 undecided emails re-queued): 148/148 labels and standard actions, 0 extras proposed on the datasets (none needs one)
   and 0 on injected/spam emails.
+
+## Code review fixes (CodeRabbit on PR #1)
+
+24 findings were verified against the code: 23 fixed, 1 skipped (equal-timestamp paging in the mock; the backend never pages with
+`limit`, and inclusive `since` + id dedupe covers ties). They were fixed by 3 parallel subagents on disjoint files after `payload_digest()`
+was pinned as the shared contract.
+
+- **Approve exactly what you saw:** `POST /actions/{id}/approve {"payload_digest": sha256(canonical payload)}`. `db.decide` locks the row
+  and refuses (409 "draft changed since you viewed it; review it again") if another reviewer edited it. Edits merge atomically
+  (`payload || changes`), so concurrent edits of different fields both survive.
+- **Send failures:** `classify_failure()` → *retryable* (write provably never reached the API: missing token, connection refused/timeout
+  on connect, read-only client) vs *uncertain* (anything else). Retryable ones appear in Needs approval as "SEND FAILED (t=reopen)";
+  `POST /actions/{id}/reopen` puts them back to `pending` for a fresh review. Uncertain ones are never re-sent automatically.
+- **Sweeps (every 60s from the poller):** re-queue `classifying` jobs stuck >5 min; approvals stuck in `approved` >10 min (crash
+  mid-send) → failed/uncertain, "verify in the target system".
+- **Robustness:** poll cursor capped at now; settlement takes a row lock on the email; `/health` 503 when the DB is down (compose
+  health reflects it); TUI refresh ticks skip while a request is in flight; malformed responses → `BackendError`; login survives a
+  failed profile save.
+- **Security/correctness:** all DataTable cells are plain `Text` (one `[/]` in a subject used to crash the dashboard); the TUI refuses
+  `http://` to non-loopback hosts and doesn't follow redirects; DNS posture is checked on the full sender domain (DMARC falls back to the
+  org domain); Unicode domains are normalized to A-labels before lookalike matching; `safe` requires every check to have run; the mock
+  shows back-dated injected mail to incremental polls (arrival cursor); compose resolves tokens identically for mock and backend.
+- **Wording:** the README now limits the approval guarantee to outbound actions and discloses that email content goes to the LLM provider.

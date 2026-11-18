@@ -136,7 +136,8 @@ Your support inbox gets sorted before anyone opens it. Every new email is read, 
 | Sales inquiry | a reply **and** a new CRM lead | a support agent, each one separately |
 | Spam / phishing | nothing: logged and set aside | nobody |
 
-**Nothing leaves the building without a person approving it.** Agents work from a terminal dashboard with three tabs
+**No reply, Slack alert or CRM entry goes out without a person approving it.** To sort and draft, the email's sender,
+subject and body are sent to the configured AI provider (OpenRouter). Agents work from a terminal dashboard with three tabs
 (*Needs approval*, *Queue*, *History*). They read the original email next to the draft, edit the wording if needed,
 then approve or reject, one at a time or in bulk. If they reject, nothing is sent; if they approve, it is sent and the
 History tab records who approved what and when.

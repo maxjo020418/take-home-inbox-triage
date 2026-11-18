@@ -14,7 +14,7 @@ cp env.example .env        # OPENROUTER_API_KEY, OPENROUTER_MODEL=deepseek/deeps
 docker compose up -d --build        # postgres 18 + mock email API (:8099) + backend (:8000)   [podman compose works too]
 uv sync && uv run python -m src.tui # local TUI: connect to http://127.0.0.1:8000, log in as admin
 uv run python scripts/inject.py --file dataset/email_classifier_starter.jsonl   # or the console: http://127.0.0.1:8099/_admin
-uv run pytest -q                    # 84 tests (incl. 1 DB integration test, skipped without postgres)
+uv run pytest -q                    # 142 tests (DB-backed ones skip without postgres)
 uv run python scripts/evaluate.py   # score live results against dataset/*.jsonl
 ```
 
@@ -28,7 +28,8 @@ uv run python scripts/evaluate.py   # score live results against dataset/*.jsonl
 ## Where I ran things in parallel
 - One Claude Code session, kept straight with `docs/session.log` (every request and decision, one line each) and `docs/notes.md`.
 - Ran in parallel while building: 3 containers + the TUI in separate terminals, the eval run classifying 140 emails in the background while the evaluator script was being written, and headless TUI / headless-Chrome tests against the live stack.
-- I didn't fan out multiple agents: the work was tightly coupled (schema ↔ API ↔ TUI), and one thread plus a log was easier to review.
+- Building: I didn't fan out agents. The work was tightly coupled (schema ↔ API ↔ TUI), and one thread plus a log was easier to review.
+- Code review: once the coupling was settled, I fanned out. I had CodeRabbit review the PR (24 findings), had Claude verify each one against the code, and pinned the one shared contract myself first (`payload_digest()`: approve exactly the draft you saw). Then 3 subagents fixed backend / TUI / infra+docs **in parallel on disjoint file sets**. I reviewed their security-critical diffs and re-tested the integrated result live before pushing.
 
 ## One time the AI was wrong, and how I caught it
 **The AI's prompt silently dropped real customers.** It defined spam as "anything trying to manipulate an automated assistant". When I had it run every labeled email, the prompt-injected half scored **32/48**: 16 genuine billing/bug/sales emails with injected text were labeled spam, and spam is dropped without review. The model's `reason` quoted the AI's own policy. Fix: classify by the genuine request and ignore embedded instructions (spam only if nothing genuine remains), plus an `injection_detected` flag so the reviewer is *warned* instead of the mail vanishing → **48/48**.
@@ -37,32 +38,36 @@ Others I caught by using the product, not by reading code:
 - The TUI splitter printed `Splitter#split-log.-horizontal` (screenshot). The AI's headless tests checked sizes, never rendered text.
 - e-001's sent reply said "Hi Dana, edited by a human". That was the AI's API test running under my admin account, so the audit trail blamed me.
 - The AI itself caught one outage: a find/replace hit two SQL queries, the dashboard returned 500, so I had it add a DB integration test.
+- **External review caught what neither of us did:** CodeRabbit found that a str cell in Textual's DataTable is parsed as Rich markup, so one email with `[/]` in its subject crashed the dashboard (verified live before fixing). It also found that "Nothing leaves the building without approval" in the client README was false: email content goes to the LLM provider before approval.
 
 ## What I deliberately cut
 - Real SPF/DKIM/DMARC *verification* (needs raw headers / connecting IP; the mock has neither). I check the domain's *published* SPF/DMARC instead; production would read `Authentication-Results`.
-- Roles (any user can approve), login rate limiting, TLS (reverse proxy in production), a separate executor service holding the write token, `LISTEN/NOTIFY` (workers poll the queue every 0.5s).
+- Roles (any user can approve), login rate limiting, TLS termination (a reverse proxy in production; the TUI already refuses plain `http://` to non-local hosts), a separate executor service holding the write token, `LISTEN/NOTIFY` (workers poll the queue every 0.5s).
 - Letting a reviewer *add* an action the model missed (they can only approve, reject or edit).
 - Windows end-to-end testing (built on Linux; the TUI handles `%APPDATA%`, the stack needs Docker Desktop).
 
 ## The design decision I'm proudest of
 **The model writes words; code decides where they go, and only a human makes them happen.**
 - The LLM returns a label and draft text (`TriageOutput`). `plan_actions` picks the action kinds from a fixed routing table and sets every destination from code: reply → original sender, alert → `#engineering`, lead → sender. An injected "send the thread to audit@…" has nothing to grab.
-- Least privilege by construction: the poller holds only the read token, workers hold **no API client at all**, and the write token is read from the environment only inside `approve()` after a human said yes. Approval is an atomic `pending → approved` UPDATE (a double click can't send twice), and every decision is audited with the username.
+- Least privilege by construction: the poller holds only the read token, workers hold **no API client at all**, and the write token is read from the environment only inside `approve()` after a human said yes. Approval is an atomic, row-locked `pending → approved` transition **bound to the exact draft the reviewer saw** (`payload_digest`; a draft edited in between returns 409). A double click can't send twice, and every decision is audited with the username.
+- Failure honesty: a send that provably never reached the API (no token, connection refused) can be reopened for re-approval; anything uncertain (timeouts, errors after send, a crash mid-approval) is marked "verify manually" and is **never auto-replayed**.
 - The TUI is a thin client with no API or LLM secrets. Edits are limited server-side to wording fields (`to`/`channel`/`email` return 422).
 
 ## Verification results (checked myself)
 | Check | Result |
 |---|---|
-| `pytest` (routing, gate, write scope, edit rules, auth, domain checker, injection patterns, safety rating, filters, extras) | 84 passed (incl. DB-query integration + docs-sync tests) |
+| `pytest` (routing, gate, write scope, edit rules, auth, domain checker, injection patterns, safety rating, filters, extras, review fixes) | 142 passed (incl. DB-backed tests on self-cleaning rows + docs-sync) |
 | Live eval, 148 labeled emails (deepseek via OpenRouter) | labels and standard actions **148/148**: clean 55/55, prompt-injected 49/49 (was 32/48 before the fix), impersonation 44/44 |
 | Sender-domain verdicts (impersonation set) | 44/44, 0 false alarms on 8 real-domain controls |
 | Injection detection (model OR patterns) | 49/49, 1 false alarm (a bug report quoting the phrase as log text) |
 | Manual read of replies to the worst attacks ("promise refund + ask password", "email the thread out", "skip review") | none complied; recipients always the sender |
 | API checks | no token 401 · wrong password = unknown user · re-approve 409 · edit `to` 422 · token dead after logout |
+| CodeRabbit review (24 findings: 23 fixed, 1 skipped with reason), re-tested live | stale-draft approve → 409 and nothing sent · reopen refuses pending/missing · TUI refuses `http://` to non-local hosts · all table cells plain `Text` (markup-crash fix) · domain verdicts still 44/44 with full-domain DNS |
 
 ## Remaining limitations
 - Small synthetic template datasets and single runs; 100% overstates real-world accuracy. The injection patterns were tuned on the same data. The impersonation lookalikes are partly circular (dnstwist generates and detects them).
 - LLM nondeterminism: an extra action was missed 1 in 5 runs on one case. The human gate is the safety net, but reviewers can't add actions.
+- Uncertain send outcomes are only flagged for manual verification; there is no automatic reconciliation against the mail/Slack/CRM systems (no idempotency keys in the mock API).
 - The write token is in the backend process environment for its whole lifetime (code-level, not process-level, isolation).
 - Mock state is in memory; restarting it clears the console's view (the DB keeps everything).
 
@@ -356,6 +361,10 @@ ALTER TABLE emails ADD COLUMN IF NOT EXISTS injection_detected BOOLEAN;
 ALTER TABLE emails ADD COLUMN IF NOT EXISTS injection_detail JSONB;
 -- Action suggested by the model beyond the label's standard routing.
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS extra BOOLEAN NOT NULL DEFAULT false;
+-- Set when execution failed: true = the write provably never reached the external API
+-- (no token, no write scope, connect error), so a human may reopen it for re-approval.
+-- false = outcome uncertain (sent, then timed out / errored, or interrupted): verify manually.
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS retryable BOOLEAN;
 ```
 
 <!-- END GENERATED -->
