@@ -1,4 +1,41 @@
+[project]
+name = "inbox-triage"
+version = "0.1.0"
+description = "Inbox triage: classify customer emails and propose human-approved actions."
+readme = "README.md"
+requires-python = ">=3.15"
+# Shared by every component (core skill module).
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.14.3",
+    "python-dotenv>=1.2.4",
+]
+
+[dependency-groups]
+# Backend API + workers, and the mock email server (both run in containers).
+backend = [
+    "fastapi>=0.163.2",
+    "uvicorn>=0.54.0",
+    "pydantic-ai-slim[openrouter]>=2.70.0",
+    "psycopg[binary]>=3.3.9",
+    "psycopg-pool>=3.3.3",
+    "dnstwist>=20250130",
+    "dnspython>=2.9.2",
+]
+# Local thin client: talks only to the backend, holds no API/LLM secrets.
+tui = [
+    "textual>=8.2.8",
+    "tomli-w>=1.2.0",
+]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.uv]
+# This is an application, not a library; don't build/install it as a package.
+package = false
+# `uv sync` locally installs everything; containers pick only `backend`.
+default-groups = ["backend", "tui", "dev"]
+
 [tool.pytest.ini_options]
-# If you choose to write tests, this makes `from src.triage_skill import ...` work
-# without installing anything.
 pythonpath = ["."]
