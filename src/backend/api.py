@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from src.backend import auth, domain_check, pipeline
@@ -87,11 +87,13 @@ User = Annotated[dict, Depends(current_user)]
 
 # -- public -------------------------------------------------------------------
 @app.get("/health")
-async def health(db: DBDep) -> dict:
+async def health(db: DBDep, response: Response) -> dict:
     try:
         db_ok = await db.ping()
     except Exception:
         db_ok = False
+    if not db_ok:  # so orchestrators / load balancers see the failure, not just the body
+        response.status_code = 503
     return {"status": "ok" if db_ok else "degraded", "db": db_ok, "version": VERSION}
 
 
@@ -138,19 +140,33 @@ async def dashboard(db: DBDep, user: User, events_after: int = 0) -> dict[str, A
     return {"approvals": approvals, "working": working, "history": history, "events": events[::-1]}
 
 
+STALE_DETAIL = "draft changed since you viewed it; review it again"
+REOPEN_DETAIL = "only failed actions whose write never reached the API can be reopened"
+
+
 def _outcome_response(outcome: str, detail: Any) -> dict:
     if outcome == "not_found":
         raise HTTPException(404, "no such action")
     if outcome == "already_decided":
         raise HTTPException(409, "action was already decided")
+    if outcome == "stale":
+        raise HTTPException(409, STALE_DETAIL)
     if outcome == "failed":
         raise HTTPException(502, f"approved, but execution failed: {detail}")
     return {"outcome": outcome, "result": detail}
 
 
+class ApproveIn(BaseModel):
+    # sha256 of the payload the reviewer saw (src.triage_skill.payload_digest; also served
+    # as `payload_digest` on approval rows). Omitted = no staleness check (legacy clients).
+    payload_digest: str | None = None
+
+
 @app.post("/actions/{action_id}/approve")
-async def approve_action(action_id: int, db: DBDep, user: User, s: Annotated[Settings, Depends(get_settings)]) -> dict:
-    return _outcome_response(*await pipeline.approve(db, s, action_id, user["username"]))
+async def approve_action(action_id: int, db: DBDep, user: User, s: Annotated[Settings, Depends(get_settings)],
+                         body: ApproveIn | None = None) -> dict:
+    digest = body.payload_digest if body else None
+    return _outcome_response(*await pipeline.approve(db, s, action_id, user["username"], expected_digest=digest))
 
 
 @app.post("/actions/{action_id}/reject")
@@ -171,13 +187,25 @@ async def edit_action(action_id: int, body: EditIn, db: DBDep, user: User) -> di
         raise HTTPException(404, "no such action")
     if action["status"] != "pending":
         raise HTTPException(409, "only pending actions can be edited")
-    try:
-        payload = apply_edit(action["kind"], action["payload"], body.changes)
+    try:  # validation only: the field whitelist depends on kind, never on current contents
+        apply_edit(action["kind"], action["payload"], body.changes)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if not await db.update_payload(action_id, payload, user["username"], sorted(body.changes)):
+    # Merge just the changed fields in SQL, so a concurrent edit of another field survives.
+    payload = await db.update_payload(action_id, body.changes, user["username"])
+    if payload is None:
         raise HTTPException(409, "action was decided while editing")
     return {"payload": payload}
+
+
+@app.post("/actions/{action_id}/reopen")
+async def reopen_action(action_id: int, db: DBDep, user: User) -> dict:
+    """failed-but-never-sent -> pending, to be reviewed and approved again."""
+    if not await db.reopen_action(action_id, user["username"]):
+        if await db.get_action(action_id) is None:
+            raise HTTPException(404, "no such action")
+        raise HTTPException(409, REOPEN_DETAIL)
+    return {"outcome": "reopened"}
 
 
 @app.post("/emails/{email_id}/retry")

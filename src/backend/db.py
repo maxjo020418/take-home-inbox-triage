@@ -16,7 +16,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from src.triage_skill import ProposedAction
+from src.triage_skill import ProposedAction, payload_digest
+
+INTERRUPTED_ERROR = ("execution interrupted after approval; outcome unknown — "
+                     "verify in the target system before re-sending")
 
 SCHEMA = (Path(__file__).parent / "schema.sql").read_text()
 
@@ -26,6 +29,10 @@ async def _event(conn: AsyncConnection, actor: str, message: str, email_id: str 
         "INSERT INTO events (actor, email_id, action_id, message) VALUES (%s, %s, %s, %s)",
         (actor, email_id, action_id, message),
     )
+
+
+class StaleDraft(Exception):
+    """The payload changed since the reviewer computed its digest; nothing was decided."""
 
 
 class DB:
@@ -113,6 +120,24 @@ class DB:
             )
             return cur.rowcount
 
+    async def reconcile_interrupted(self, older_than_s: float = 600) -> int:
+        """Approved actions with no recorded execution after `older_than_s`: the process
+        died between approval and record_execution. The write may or may not have gone
+        out, so mark them failed (not retryable) for a human to verify. Never replays."""
+        async with self.pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                """UPDATE actions SET status='failed', retryable=false, error=%s, executed_at=now()
+                   WHERE status='approved' AND executed_at IS NULL
+                     AND decided_at < now() - make_interval(secs => %s)
+                   RETURNING id, email_id, kind""",
+                (INTERRUPTED_ERROR, older_than_s),
+            )
+            rows = await cur.fetchall()
+            for r in rows:
+                await _event(conn, "system", f"execution FAILED {r['kind']}: {INTERRUPTED_ERROR}", r["email_id"], r["id"])
+                await self._close_email_if_settled(conn, r["email_id"])
+        return len(rows)
+
     async def claim_next(self) -> dict | None:
         return await self._one(
             """UPDATE emails SET status='classifying', attempts=attempts+1, locked_at=now(), updated_at=now()
@@ -183,11 +208,21 @@ class DB:
     async def get_action(self, action_id: int) -> dict | None:
         return await self._one("SELECT * FROM actions WHERE id=%s", (action_id,))
 
-    async def decide(self, action_id: int, *, approve: bool, actor: str) -> dict | None:
+    async def decide(self, action_id: int, *, approve: bool, actor: str,
+                     expected_digest: str | None = None) -> dict | None:
         """Atomically move pending -> approved|rejected. Returns the row only if
-        THIS call made the transition, so a double click can't execute twice."""
+        THIS call made the transition, so a double click can't execute twice.
+        With `expected_digest`, raises StaleDraft (no transition) unless the stored
+        payload is still the one the reviewer saw; the row lock keeps an edit from
+        slipping in between the check and the transition."""
         verdict = "approved" if approve else "rejected"
         async with self.pool.connection() as conn, conn.transaction():
+            cur = await conn.execute("SELECT payload FROM actions WHERE id=%s AND status='pending' FOR UPDATE", (action_id,))
+            locked = await cur.fetchone()
+            if locked is None:
+                return None
+            if expected_digest is not None and expected_digest != payload_digest(locked["payload"]):
+                raise StaleDraft(action_id)
             cur = await conn.execute(
                 """UPDATE actions SET status=%s, decided_at=now(), decided_by=%s
                    WHERE id=%s AND status='pending' RETURNING *""",
@@ -200,12 +235,15 @@ class DB:
                     await self._close_email_if_settled(conn, row["email_id"])
         return row
 
-    async def record_execution(self, action_id: int, *, result: dict | None = None, error: str | None = None) -> None:
+    async def record_execution(self, action_id: int, *, result: dict | None = None, error: str | None = None,
+                               retryable: bool | None = None) -> None:
+        """`retryable` only matters on failure: True iff the write never reached the API."""
         async with self.pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
-                """UPDATE actions SET status=%s, result=%s, error=%s, executed_at=now()
+                """UPDATE actions SET status=%s, result=%s, error=%s, retryable=%s, executed_at=now()
                    WHERE id=%s AND status='approved' RETURNING email_id, kind""",
-                ("failed" if error else "executed", Jsonb(result) if result else None, error, action_id),
+                ("failed" if error else "executed", Jsonb(result) if result else None, error,
+                 bool(retryable) if error else None, action_id),
             )
             row = await cur.fetchone()
             if row:
@@ -213,19 +251,46 @@ class DB:
                 await _event(conn, "system", msg, row["email_id"], action_id)
                 await self._close_email_if_settled(conn, row["email_id"])
 
-    async def update_payload(self, action_id: int, payload: dict, actor: str, fields: list[str]) -> bool:
+    async def update_payload(self, action_id: int, changes: dict, actor: str) -> dict | None:
+        """Merge only the (already validated) changed fields, so two concurrent edits of
+        different fields both survive. Returns the resulting payload, or None if the
+        action is no longer pending."""
         async with self.pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
-                "UPDATE actions SET payload=%s WHERE id=%s AND status='pending' RETURNING email_id",
-                (Jsonb(payload), action_id),
+                """UPDATE actions SET payload = payload || %s::jsonb
+                   WHERE id=%s AND status='pending' RETURNING email_id, payload""",
+                (Jsonb(changes), action_id),
             )
             row = await cur.fetchone()
             if row:
-                await _event(conn, actor, f"edited draft ({', '.join(fields)})", row["email_id"], action_id)
+                await _event(conn, actor, f"edited draft ({', '.join(sorted(changes))})", row["email_id"], action_id)
+            return row["payload"] if row else None
+
+    async def reopen_action(self, action_id: int, actor: str) -> bool:
+        """failed (write never reached the API) -> pending: back to the approvals
+        queue, to be reviewed and approved again. Uncertain failures stay failed."""
+        async with self.pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                """UPDATE actions SET status='pending', decided_at=NULL, decided_by=NULL, error=NULL,
+                                      retryable=NULL, result=NULL, executed_at=NULL
+                   WHERE id=%s AND status='failed' AND retryable RETURNING email_id, kind""",
+                (action_id,),
+            )
+            row = await cur.fetchone()
+            if row:
+                await conn.execute(
+                    "UPDATE emails SET status='needs_approval', updated_at=now() WHERE id=%s AND status='done'",
+                    (row["email_id"],),
+                )
+                await _event(conn, actor, f"reopened failed {row['kind']} for re-approval (write never reached the API)",
+                             row["email_id"], action_id)
             return row is not None
 
     @staticmethod
     async def _close_email_if_settled(conn: AsyncConnection, email_id: str) -> None:
+        # Lock the email first: two actions settling concurrently each see the other's
+        # (uncommitted) row as still open; serialized, the second sees the first's commit.
+        await conn.execute("SELECT 1 FROM emails WHERE id=%s FOR UPDATE", (email_id,))
         await conn.execute(
             """UPDATE emails SET status='done', updated_at=now()
                WHERE id=%s AND status='needs_approval'
@@ -235,18 +300,26 @@ class DB:
 
     # -- dashboard views ----------------------------------------------------------
     async def view_approvals(self) -> list[dict]:
-        return await self._all(
-            """SELECT 'action' AS row_type, a.id AS action_id, a.kind, a.payload, a.rationale, a.extra,
+        """row_type: 'action' (pending, approvable), 'exec_failed' (failed before the
+        write reached the API; reopenable), 'failed' (email classification failed)."""
+        rows = await self._all(
+            """SELECT CASE WHEN a.status='pending' THEN 'action' ELSE 'exec_failed' END AS row_type,
+                      a.id AS action_id, a.kind, a.payload, a.rationale, a.extra,
+                      a.status AS action_status, a.error AS action_error, a.retryable,
                       e.id AS email_id, e.sender, e.subject, e.body, e.label, NULL AS last_error,
                       e.domain_verdict, e.domain_detail, e.received_at, e.injection_detected, e.injection_detail
                FROM actions a JOIN emails e ON e.id = a.email_id
-               WHERE a.status='pending'
+               WHERE a.status='pending' OR (a.status='failed' AND a.retryable)
                UNION ALL
-               SELECT 'failed', NULL, NULL, NULL, NULL, NULL, id, sender, subject, body, label, last_error,
+               SELECT 'failed', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                      id, sender, subject, body, label, last_error,
                       domain_verdict, domain_detail, received_at, injection_detected, injection_detail
                FROM emails WHERE status='failed'
                ORDER BY received_at DESC, email_id, action_id NULLS LAST"""
         )
+        for r in rows:  # what the client echoes back on approve (see decide)
+            r["payload_digest"] = payload_digest(r["payload"]) if r["payload"] is not None else None
+        return rows
 
     async def view_working(self) -> list[dict]:
         return await self._all(
@@ -260,7 +333,7 @@ class DB:
             """SELECT e.id AS email_id, e.sender, e.subject, e.body, e.label, e.status, e.reason, e.updated_at, e.received_at,
                       e.domain_verdict, e.domain_detail, e.injection_detected, e.injection_detail,
                       coalesce(json_agg(json_build_object('id', a.id, 'kind', a.kind, 'status', a.status,
-                               'decided_by', a.decided_by, 'error', a.error, 'payload', a.payload, 'extra', a.extra) ORDER BY a.id)
+                               'decided_by', a.decided_by, 'error', a.error, 'retryable', a.retryable, 'payload', a.payload, 'extra', a.extra) ORDER BY a.id)
                                FILTER (WHERE a.id IS NOT NULL), '[]') AS actions
                FROM emails e LEFT JOIN actions a ON a.email_id = e.id
                WHERE e.status IN ('done','dropped')

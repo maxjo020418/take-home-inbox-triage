@@ -79,3 +79,7 @@ ALTER TABLE emails ADD COLUMN IF NOT EXISTS injection_detected BOOLEAN;
 ALTER TABLE emails ADD COLUMN IF NOT EXISTS injection_detail JSONB;
 -- Action suggested by the model beyond the label's standard routing.
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS extra BOOLEAN NOT NULL DEFAULT false;
+-- Set when execution failed: true = the write provably never reached the external API
+-- (no token, no write scope, connect error), so a human may reopen it for re-approval.
+-- false = outcome uncertain (sent, then timed out / errored, or interrupted): verify manually.
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS retryable BOOLEAN;

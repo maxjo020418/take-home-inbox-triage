@@ -271,3 +271,14 @@ def apply_edit(kind: str, payload: dict, changes: dict) -> dict:
     if not all(isinstance(v, str) for v in changes.values()):
         raise ValueError("edited values must be strings")
     return {**payload, **changes}
+
+
+def payload_digest(payload: dict) -> str:
+    """Stable fingerprint of an action payload. The reviewer's client sends the
+    digest of the draft it displayed; approval is refused if the stored payload
+    no longer matches (someone edited it in between)."""
+    import hashlib
+    import json
+
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
