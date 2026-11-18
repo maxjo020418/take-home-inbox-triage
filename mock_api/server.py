@@ -46,7 +46,10 @@ _sent_mail: list[dict] = []
 _alerts: list[dict] = []
 _leads: list[dict] = []
 # Emails added at runtime via POST /_inject (demo/testing hook). Resets on restart.
+# Each record carries an internal `_arrived_at` (when it was injected), never returned
+# by /inbox: `received_at` may be historical, and incremental polling must still see it.
 _injected: list[dict] = []
+_ARRIVED = "_arrived_at"
 # Ground-truth labels for injected dataset rows. Shown on the admin page ONLY —
 # never returned by /inbox, so the agent can't see the answer key.
 _expected: dict[str, str] = {}
@@ -116,7 +119,10 @@ def _parse_ts(value: str) -> datetime:
 @app.get("/inbox")
 def get_inbox(
     _: None = Depends(require_read),
-    since: datetime | None = Query(default=None, description="Inclusive lower bound on received_at (ISO 8601)"),
+    since: datetime | None = Query(
+        default=None,
+        description="Inclusive lower bound on received_at, or on arrival time for injected mail (ISO 8601)",
+    ),
     until: datetime | None = Query(default=None, description="Exclusive upper bound on received_at (ISO 8601)"),
     limit: int | None = Query(default=None, ge=1, le=500, description="Max emails returned, oldest first"),
 ) -> list[dict]:
@@ -126,12 +132,18 @@ def get_inbox(
     for bound in (since, until):
         if bound is not None and bound.tzinfo is None:
             raise HTTPException(status_code=422, detail="since/until must include a timezone (e.g. Z)")
-    emails = json.loads(FIXTURES.read_text()) + _injected
+    emails = json.loads(FIXTURES.read_text()) + list(_injected)
     if since is not None:
-        emails = [e for e in emails if _parse_ts(e["received_at"]) >= since]
+        # An injected email whose received_at is historical still "arrived" now, so a
+        # poller using `since=<last cursor>` must see it.
+        emails = [
+            e for e in emails
+            if _parse_ts(e["received_at"]) >= since or (_ARRIVED in e and e[_ARRIVED] >= since)
+        ]
     if until is not None:
         emails = [e for e in emails if _parse_ts(e["received_at"]) < until]
     emails.sort(key=lambda e: _parse_ts(e["received_at"]))
+    emails = [{k: v for k, v in e.items() if k != _ARRIVED} for e in emails]
     return emails[:limit] if limit else emails
 
 
@@ -152,7 +164,7 @@ def _store(email: InjectedEmail, taken: set[str]) -> dict:
         "received_at": received.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "body": email.body,
     }
-    _injected.append(record)
+    _injected.append({**record, _ARRIVED: datetime.now(UTC)})
     taken.add(email_id)
     if email.label:
         _expected[email_id] = email.label
@@ -223,7 +235,10 @@ def _table(rows: list[dict], cols: list[str]) -> str:
 def admin_page() -> str:
     """Unauthenticated dev admin page (like /_audit). Bind to localhost only."""
     fixtures = [{**e, "source": "fixture"} for e in json.loads(FIXTURES.read_text())]
-    injected = [{**e, "source": "injected", "expected_label": _expected.get(e["id"])} for e in _injected]
+    injected = [
+        {**{k: v for k, v in e.items() if k != _ARRIVED}, "source": "injected", "expected_label": _expected.get(e["id"])}
+        for e in _injected
+    ]
     inbox = sorted(fixtures + injected, key=lambda e: _parse_ts(e["received_at"]), reverse=True)
     for e in inbox:
         e["body"] = e["body"] if len(e["body"]) <= 300 else e["body"][:300] + "…"

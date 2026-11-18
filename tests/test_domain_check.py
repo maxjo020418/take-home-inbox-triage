@@ -6,14 +6,21 @@ from src.backend.domain_check import check_domain, check_sender
 
 
 class FakeDNS:
-    def __init__(self, mail=True, txt=None, dmarc=None, nx=False):
-        self.mail, self.txt_records, self.dmarc, self.nx = mail, txt or [], dmarc, nx
+    """`only` (optional): the set of names that exist; anything else is NXDOMAIN."""
+
+    def __init__(self, mail=True, txt=None, dmarc=None, nx=False, only=None):
+        self.mail, self.txt_records, self.dmarc, self.nx, self.only = mail, txt or [], dmarc, nx, only
+        self.queried: list[str] = []
+
+    def _nx(self, name):
+        self.queried.append(name)
+        return self.nx or (self.only is not None and name not in self.only)
 
     def has_mail_host(self, name):
-        return None if self.nx else self.mail
+        return None if self._nx(name) else self.mail
 
     def txt(self, name):
-        if self.nx:
+        if self._nx(name):
             return None
         return [self.dmarc] if name.startswith("_dmarc.") and self.dmarc else ([] if name.startswith("_dmarc.") else self.txt_records)
 
@@ -82,3 +89,33 @@ def test_dns_outage_is_unknown_not_suspicious():
         txt = has_mail_host
     c = check_sender("a@acme.io", resolver=Down())
     assert c.verdict == "ok" and c.has_mx is None and any("DNS unavailable" in r for r in c.reasons)
+
+
+def test_unicode_lookalike_normalized_to_a_label():
+    unicode_form = b"xn--80ak6aa92e.com".decode("idna")  # "аррӏе.com", all Cyrillic
+    assert unicode_form != "xn--80ak6aa92e.com"
+    c = check_sender(f"a@{unicode_form}", resolver=GOOD)
+    assert c.verdict == "impersonation_suspected" and c.lookalike_of == "apple.com"
+    assert c.domain == "xn--80ak6aa92e.com"
+    assert any("punycode" in r for r in c.reasons)
+
+
+def test_unicode_idn_gets_punycode_signal():
+    c = check_sender("a@münchen.de", resolver=GOOD)
+    assert c.verdict == "check_needed" and any("punycode" in r for r in c.reasons)
+
+
+def test_nonexistent_subdomain_of_real_org_is_checked_itself():
+    dns = FakeDNS(txt=["v=spf1 -all"], dmarc="v=DMARC1; p=reject", only={"microsoft.com", "_dmarc.microsoft.com"})
+    c = check_sender("a@missing.microsoft.com", resolver=dns)
+    assert c.verdict == "check_needed" and any("missing.microsoft.com does not exist" in r for r in c.reasons)
+    assert dns.queried[0] == "missing.microsoft.com"
+
+
+def test_spf_on_sender_domain_dmarc_falls_back_to_org_domain():
+    dns = FakeDNS(txt=["v=spf1 -all"], dmarc="v=DMARC1; p=quarantine",
+                  only={"mail.acme.io", "_dmarc.acme.io"})
+    c = check_sender("a@mail.acme.io", resolver=dns)
+    assert c.verdict == "ok" and c.spf == "v=spf1 -all" and c.dmarc_policy == "quarantine"
+    assert dns.queried.index("_dmarc.mail.acme.io") < dns.queried.index("_dmarc.acme.io")
+    assert "acme.io" not in dns.queried  # SPF/mail host looked up on the full sender domain

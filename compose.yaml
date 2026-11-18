@@ -33,7 +33,9 @@ services:
   backend:
     build: { context: ., target: backend }
     env_file: .env            # OpenRouter key, tokens, bootstrap user
-    environment:
+    environment:  # same required interpolation as `mock`, so both services resolve identical tokens
+      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env}
+      WRITE_TOKEN: ${WRITE_TOKEN:?set WRITE_TOKEN in .env}
       API_BASE_URL: http://mock:8099
       DATABASE_URL: postgresql://triage:triage@db:5432/triage
     ports: ["127.0.0.1:8000:8000"]

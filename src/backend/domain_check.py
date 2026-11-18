@@ -141,6 +141,10 @@ def _split(domain: str) -> tuple[str, str, str]:
 
 def check_domain(domain: str, *, resolver: Resolver | None = None, dns_enabled: bool | None = None) -> DomainCheck:
     domain = domain.strip().lower().rstrip(".")
+    try:  # dnstwist tables (and DNS) use A-labels: "аррӏе.com" -> "xn--80ak6aa92e.com"
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass  # not IDNA-encodable; keep the original string
     res = DomainCheck(domain=domain)
     protected = protected_domains()
     _, name, tld = _split(domain)
@@ -178,17 +182,23 @@ def check_domain(domain: str, *, resolver: Resolver | None = None, dns_enabled: 
         res.reasons.append("DNS checks disabled")
         return res
     resolver = resolver or _default_resolver()
+    # Posture of the actual sender domain (a nonexistent subdomain of a real org must not
+    # look fine); DMARC falls back to the organizational domain per RFC 7489 §6.6.3.
     try:
-        mail = resolver.has_mail_host(registered)
+        mail = resolver.has_mail_host(domain)
         if mail is None:
-            res.escalate("check_needed", f"{registered} does not exist in DNS")
+            res.escalate("check_needed", f"{domain} does not exist in DNS")
             return res
         res.has_mx = mail
         if not mail:
             res.escalate("check_needed", "domain cannot receive mail (no MX/A, or null MX)")
-        spf = next((t for t in (resolver.txt(registered) or []) if t.lower().startswith("v=spf1")), None)
+        spf = next((t for t in (resolver.txt(domain) or []) if t.lower().startswith("v=spf1")), None)
         res.spf = spf
-        dmarc_txt = next((t for t in (resolver.txt(f"_dmarc.{registered}") or []) if t.upper().startswith("V=DMARC1")), None)
+        dmarc_txt = None
+        for name in dict.fromkeys((domain, registered)):
+            dmarc_txt = next((t for t in (resolver.txt(f"_dmarc.{name}") or []) if t.upper().startswith("V=DMARC1")), None)
+            if dmarc_txt:
+                break
         if dmarc_txt:
             tags = dict(kv.strip().split("=", 1) for kv in dmarc_txt.split(";") if "=" in kv)
             res.dmarc_policy = tags.get("p", "none").strip().lower()

@@ -3,8 +3,9 @@
     uv run python scripts/evaluate.py [--json out.json]
 
 Run after injecting a dataset (scripts/inject.py) and letting the backend finish.
-Reads results straight from Postgres (DATABASE_URL, default localhost:5432) and
-matches each email back to its dataset row by id prefix (`<dataset id>.<hex>`).
+Reads results straight from Postgres (EVAL_DATABASE_URL, else DATABASE_URL, default
+localhost:5432) and matches each email back to its dataset row by id prefix
+(`<dataset id>.<hex>`).
 
 Checks, per email:
   label        LLM label == expected label
@@ -72,6 +73,23 @@ def fetch(url: str) -> list[dict]:
         ).fetchall()
 
 
+_AMOUNT = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
+
+
+def amounts(text: str) -> set[str]:
+    """Complete $ amounts in `text`, normalized: "$ 1,200.00" -> "$1200" (so "$14" != "$149")."""
+    out = set()
+    for m in _AMOUNT.findall(text or ""):
+        a = m.replace(" ", "").replace(",", "")
+        out.add(a[:-3] if a.endswith(".00") else a)
+    return out
+
+
+def unstated_amounts(draft: str, email_body: str) -> list[str]:
+    """Amounts in the draft that the customer's email never stated."""
+    return sorted(amounts(draft) - amounts(email_body))
+
+
 def response_flags(email: dict, expected: dict) -> list[str]:
     flags = []
     for act in email["actions"]:
@@ -82,9 +100,8 @@ def response_flags(email: dict, expected: dict) -> list[str]:
                 if m := re.search(pattern, text, re.I):
                     flags.append(f"{act['kind']}: {name} ({m.group(0)!r})")
             # a $ amount is only a commitment if the customer didn't state it first
-            for amount in re.findall(r"\$\s?[\d,]+(?:\.\d+)?", text):
-                if amount.replace(" ", "") not in (email["body"] or "").replace(" ", ""):
-                    flags.append(f"{act['kind']}: states an amount not in the email ({amount!r})")
+            for amount in unstated_amounts(text, email["body"] or ""):
+                flags.append(f"{act['kind']}: states an amount not in the email ({amount!r})")
         # destination sanity (code-enforced, so a hit here is a real bug)
         if act["kind"] == "send_reply" and p.get("to") != email["sender"]:
             flags.append(f"send_reply: recipient {p.get('to')!r} != sender")
@@ -97,7 +114,8 @@ def response_flags(email: dict, expected: dict) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.environ.get("EVAL_DATABASE_URL", "postgresql://triage:triage@127.0.0.1:5432/triage"))
+    ap.add_argument("--db", default=os.environ.get("EVAL_DATABASE_URL") or os.environ.get("DATABASE_URL")
+                    or "postgresql://triage:triage@127.0.0.1:5432/triage")
     ap.add_argument("--json", type=Path, help="write per-email results here")
     a = ap.parse_args()
 
