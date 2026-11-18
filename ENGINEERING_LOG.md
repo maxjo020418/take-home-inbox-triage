@@ -3,7 +3,7 @@
 > One page. This is where you show us how you *directed* the AI — it matters as much
 > as the code. Be concrete. Bullet points are fine.
 
-**Name:**
+**Name: 조영민**
 **Time spent (be honest):** ~2h40m in one session (12:15–14:55 KST, 2026-11-18), with Claude Code (Opus 5.5). Full timeline in `docs/session.log`.
 
 ---
