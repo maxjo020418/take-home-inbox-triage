@@ -20,8 +20,11 @@ CREATE TABLE IF NOT EXISTS emails (
 );
 CREATE INDEX IF NOT EXISTS emails_status_idx ON emails (status, received_at);
 
--- One row per proposed external write. Nothing here has happened until
--- status = 'executed', and it can only get there via 'approved'.
+-- One row per proposed external write. Flow: pending -> approved -> executed | failed
+-- (or pending -> rejected). Nothing is sent before 'approved'. After approval the write
+-- may reach the external API even if the row ends 'failed' or stays 'approved' (crash):
+-- failed+retryable means it provably never left; any other failure is uncertain and must
+-- be verified in the target system before re-sending.
 CREATE TABLE IF NOT EXISTS actions (
     id           BIGSERIAL PRIMARY KEY,
     email_id     TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
@@ -83,3 +86,6 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS extra BOOLEAN NOT NULL DEFAULT fals
 -- (no token, no write scope, connect error), so a human may reopen it for re-approval.
 -- false = outcome uncertain (sent, then timed out / errored, or interrupted): verify manually.
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS retryable BOOLEAN;
+-- Identity of the current classification claim; result writes are fenced to it so a
+-- job re-queued mid-run (stale sweep) can't be overwritten by the superseded run.
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS claim_id UUID;

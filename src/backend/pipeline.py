@@ -98,10 +98,13 @@ async def process_one(db: DB, s: Settings, classify: Classifier = triage_email) 
         if suppressed := [k for k in out.extra_actions if k not in extras and k not in ROUTING[out.label]]:
             inj["suppressed_extras"] = suppressed  # recorded for the reviewer / audit
         actions = plan_actions(out.label, email, out.drafts(), extras)
-        await db.save_triage(job["id"], out.label, out.reason, actions, inj)
+        if not await db.save_triage(job["id"], out.label, out.reason, actions, inj, claim_id=job["claim_id"]):
+            log.warning("%s result discarded: claim superseded (job was re-queued while classifying)", job["id"])
+            return True
         log.info("%s -> %s (%d action(s), extras=%s)", job["id"], out.label, len(actions), extras or "-")
     except Exception as exc:
-        status = await db.mark_failed(job["id"], f"{type(exc).__name__}: {exc}", s.max_attempts)
+        status = await db.mark_failed(job["id"], f"{type(exc).__name__}: {exc}", s.max_attempts,
+                                      claim_id=job["claim_id"])
         log.warning("%s classification error (%s): %r", job["id"], status, exc)
     return True
 

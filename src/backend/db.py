@@ -114,7 +114,7 @@ class DB:
         """Re-queue jobs whose worker died mid-classification (at-least-once)."""
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                """UPDATE emails SET status='queued', locked_at=NULL, updated_at=now()
+                """UPDATE emails SET status='queued', locked_at=NULL, claim_id=NULL, updated_at=now()
                    WHERE status='classifying' AND locked_at < now() - make_interval(secs => %s)""",
                 (older_than_s,),
             )
@@ -140,7 +140,8 @@ class DB:
 
     async def claim_next(self) -> dict | None:
         return await self._one(
-            """UPDATE emails SET status='classifying', attempts=attempts+1, locked_at=now(), updated_at=now()
+            """UPDATE emails SET status='classifying', attempts=attempts+1, locked_at=now(),
+                                 claim_id=gen_random_uuid(), updated_at=now()
                WHERE id = (SELECT id FROM emails WHERE status='queued'
                            ORDER BY received_at FOR UPDATE SKIP LOCKED LIMIT 1)
                RETURNING *"""
@@ -156,18 +157,23 @@ class DB:
                 await _event(conn, "worker", f"sender domain {verdict}: {'; '.join(detail.get('reasons', []))[:200]}", email_id)
 
     async def save_triage(self, email_id: str, label: str, reason: str, actions: list[ProposedAction],
-                          injection: dict | None = None) -> None:
-        """`injection` = {"llm": bool, "patterns": [...]}; flagged if either source fired."""
+                          injection: dict | None = None, *, claim_id=None) -> bool:
+        """`injection` = {"llm": bool, "patterns": [...]}; flagged if either source fired.
+
+        Fenced to the claim that produced the result: if the job was re-queued (and maybe
+        re-claimed) while this classification ran, nothing is written and False is returned."""
         injection = injection or {"llm": False, "patterns": []}
         flagged = bool(injection["llm"] or injection["patterns"])
         status = "needs_approval" if actions else "dropped"
         async with self.pool.connection() as conn, conn.transaction():
-            await conn.execute(
+            cur = await conn.execute(
                 """UPDATE emails SET status=%s, label=%s, reason=%s, injection_detected=%s, injection_detail=%s,
-                                     last_error=NULL, locked_at=NULL, updated_at=now()
-                   WHERE id=%s""",
-                (status, label, reason, flagged, Jsonb(injection), email_id),
+                                     last_error=NULL, locked_at=NULL, claim_id=NULL, updated_at=now()
+                   WHERE id=%s AND status='classifying' AND claim_id IS NOT DISTINCT FROM %s""",
+                (status, label, reason, flagged, Jsonb(injection), email_id, claim_id),
             )
+            if cur.rowcount == 0:
+                return False  # superseded claim: discard, no actions inserted
             if flagged:
                 src = ", ".join((["model"] if injection["llm"] else []) + injection["patterns"])
                 await _event(conn, "worker", f"prompt-injection attempt detected ({src}); ignored, flagged for review", email_id)
@@ -178,19 +184,24 @@ class DB:
                 )
             kinds = ", ".join(a.kind + (" (+extra)" if a.extra else "") for a in actions) or "no action (dropped)"
             await _event(conn, "worker", f"classified {label}: {kinds}", email_id)
+        return True
 
-    async def mark_failed(self, email_id: str, error: str, max_attempts: int) -> str:
+    async def mark_failed(self, email_id: str, error: str, max_attempts: int, *, claim_id=None) -> str:
         """Back to the queue for another try, or `failed` once attempts run out.
-        Never falls back to a label: a failed email must not be silently dropped."""
+        Never falls back to a label: a failed email must not be silently dropped.
+        Fenced like save_triage: a superseded claim changes nothing ("superseded")."""
         async with self.pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
                 """UPDATE emails SET status = CASE WHEN attempts >= %s THEN 'failed' ELSE 'queued' END,
-                                     last_error=%s, locked_at=NULL, updated_at=now()
-                   WHERE id=%s RETURNING status""",
-                (max_attempts, error[:2000], email_id),
+                                     last_error=%s, locked_at=NULL, claim_id=NULL, updated_at=now()
+                   WHERE id=%s AND status='classifying' AND claim_id IS NOT DISTINCT FROM %s
+                   RETURNING status""",
+                (max_attempts, error[:2000], email_id, claim_id),
             )
             row = await cur.fetchone()
-            status = row["status"] if row else "missing"
+            if row is None:
+                return "superseded"
+            status = row["status"]
             await _event(conn, "worker", f"classification error -> {status}: {error[:200]}", email_id)
         return status
 
@@ -278,6 +289,9 @@ class DB:
             )
             row = await cur.fetchone()
             if row:
+                # Same serialization as settlement: lock the email unconditionally first, so a
+                # concurrent settle->done can't commit after we looked and leave done+pending.
+                await conn.execute("SELECT 1 FROM emails WHERE id=%s FOR UPDATE", (row["email_id"],))
                 await conn.execute(
                     "UPDATE emails SET status='needs_approval', updated_at=now() WHERE id=%s AND status='done'",
                     (row["email_id"],),

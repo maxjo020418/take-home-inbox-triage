@@ -537,8 +537,11 @@ class DashboardScreen(Screen):
                 self._refreshing = None
 
     async def _refresh_once(self) -> None:
+        client = self.app.client
+        if client is None:  # logged out before this refresh started
+            return
         try:
-            data = await self.client.dashboard(self._last_event)
+            data = await client.dashboard(self._last_event)
         except Unauthorized:
             self.notify("Session expired. Please log in again.", severity="warning")
             await self.app.drop_client()

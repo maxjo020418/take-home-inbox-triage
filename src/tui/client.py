@@ -70,6 +70,8 @@ class BackendClient:
         if r.is_redirect:  # not followed: the bearer token must not be replayed to another URL
             raise BackendError(f"backend redirected to {r.headers.get('location', '?')}; "
                                "refusing to follow (use the final URL directly)", r.status_code)
+        if not r.is_success:  # e.g. a 304 or other non-2xx that slipped past the checks above
+            raise BackendError(f"unexpected response from backend ({r.status_code})", r.status_code)
         if not r.content:
             return None
         try:
@@ -82,6 +84,8 @@ class BackendClient:
 
     async def login(self, username: str, password: str) -> dict:
         out = await self._req("POST", "/auth/login", json={"username": username, "password": password})
+        if not (isinstance(out, dict) and isinstance(out.get("token"), str) and isinstance(out.get("username"), str)):
+            raise BackendError("malformed login response from backend", 200)
         self._token, self.username = out["token"], out["username"]
         return out
 
@@ -93,7 +97,11 @@ class BackendClient:
             self._token = self.username = None
 
     async def dashboard(self, events_after: int = 0) -> dict:
-        return await self._req("GET", "/dashboard", params={"events_after": events_after})
+        data = await self._req("GET", "/dashboard", params={"events_after": events_after})
+        if not (isinstance(data, dict)
+                and all(isinstance(data.get(k), list) for k in ("approvals", "working", "history", "events"))):
+            raise BackendError("malformed dashboard response from backend", 200)
+        return data
 
     async def approve(self, action_id: int, payload_digest: str | None = None) -> dict:
         """`payload_digest` binds the approval to the draft the reviewer saw (409 if it changed)."""
