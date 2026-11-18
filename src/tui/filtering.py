@@ -19,6 +19,14 @@ from src.tui.safety import assess
 FIELDS = ("id", "from", "subject", "label", "action", "status", "domain", "to", "safety")
 
 
+def _dest(payload: dict) -> str:
+    return payload.get("to") or payload.get("channel") or payload.get("email") or ""
+
+
+def _preview(payload: dict) -> str:
+    return payload.get("body") or payload.get("message") or payload.get("summary") or ""
+
+
 def searchable(row: dict) -> dict[str, str]:
     """Normalize a dashboard row (any tab) into the fields a query can address."""
     payload = row.get("payload") or {}
@@ -30,14 +38,15 @@ def searchable(row: dict) -> dict[str, str]:
         "label": row.get("label") or "",
         "action": " ".join(filter(None, [row.get("kind") or "", "extra" if row.get("extra") else "",
                                          *(a.get("kind", "") + (" extra" if a.get("extra") else "") for a in actions)])),
-        "status": " ".join(filter(None, [row.get("status") or ("failed" if row.get("row_type") == "failed" else "pending"),
+        "status": " ".join(filter(None, [row.get("status") or row.get("action_status")
+                                         or ("failed" if row.get("row_type") == "failed" else "pending"),
                                          *(a.get("status", "") for a in actions)])),
         "domain": row.get("domain_verdict") or "",
-        "to": payload.get("to") or payload.get("channel") or payload.get("email") or "",
+        "to": " ".join(filter(None, [_dest(payload), *(_dest(a.get("payload") or {}) for a in actions)])),
     }
     sf = assess(row)  # safety:warn, safety:injection, safety:danger, safety:impersonation ...
     fields["safety"] = " ".join([sf.word, *(c.name for c in sf.checks if c.rank > 0)])
-    preview = payload.get("body") or payload.get("message") or payload.get("summary") or ""
+    preview = " ".join(filter(None, [_preview(payload), *(_preview(a.get("payload") or {}) for a in actions)]))
     fields["_all"] = " ".join([*fields.values(), preview, row.get("reason") or row.get("rationale") or ""])
     return {k: v.lower() for k, v in fields.items()}
 

@@ -5,8 +5,8 @@ Levels (worst first):
   warn    ⚠  prompt-injection attempt detected (even if ignored and a reply was drafted)
   check   ?   sender domain needs checking (doesn't exist, no SPF/DMARC, brand name, punycode)
               or classification failed
-  safe    ✓   all checks passed
-  pending …   checks haven't run yet
+  safe    ✓   all checks completed and passed
+  pending …   checks haven't (all) run yet; a classified email with a missing check is "check"
 """
 
 from __future__ import annotations
@@ -86,9 +86,20 @@ def assess(row: dict) -> Safety:
     elif row.get("injection_detected") is False:
         checks.append(Check("injection", 0, "none detected"))
 
+    # "safe" requires every check to have completed. A classified email whose
+    # domain/injection check is missing must not read as all-clear.
+    if row.get("label"):
+        if verdict is None:
+            checks.append(Check("domain", 1, "domain check did not run"))
+        if row.get("injection_detected") is None:
+            checks.append(Check("injection", 1, "injection check did not run"))
+
     if row.get("row_type") == "failed" or row.get("status") == "failed":
         checks.append(Check("classification", 1, row.get("last_error") or "classification failed"))
 
     if not checks:
         return Safety(-1, [])
-    return Safety(max(c.rank for c in checks), checks)
+    rank = max(c.rank for c in checks)
+    if rank == 0 and (verdict is None or row.get("injection_detected") is None):
+        return Safety(-1, checks)  # not classified yet and some checks still to run: pending, not safe
+    return Safety(rank, checks)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -21,10 +23,34 @@ class Disconnected(BackendError):
     pass
 
 
+def check_backend_url(url: str) -> str | None:
+    """Why `url` must not be used (None if fine). Credentials and the session token
+    travel in plaintext over http, so http is allowed only to loopback hosts."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        return f"invalid backend URL: {url!r}"
+    if parts.scheme not in ("http", "https") or not host:
+        return "backend URL must start with https:// (or http:// for localhost)"
+    if parts.scheme == "https":
+        return None
+    if host == "localhost":
+        return None
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return None
+    except ValueError:
+        pass
+    return f"refusing plaintext http:// to {host}: use https:// (http is only allowed for localhost)"
+
+
 class BackendClient:
     def __init__(self, base_url: str, *, timeout: float = 15.0, transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = base_url.rstrip("/")
-        self._http = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=transport)
+        self._http = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=transport,
+                                       follow_redirects=False)  # never resend the token elsewhere
         self._token: str | None = None
         self.username: str | None = None
 
@@ -41,7 +67,15 @@ class BackendClient:
             raise Unauthorized(_detail(r), 401)
         if r.status_code >= 400:
             raise BackendError(_detail(r), r.status_code)
-        return r.json() if r.content else None
+        if r.is_redirect:  # not followed: the bearer token must not be replayed to another URL
+            raise BackendError(f"backend redirected to {r.headers.get('location', '?')}; "
+                               "refusing to follow (use the final URL directly)", r.status_code)
+        if not r.content:
+            return None
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise BackendError(f"malformed response from backend ({r.status_code})", r.status_code) from exc
 
     async def health(self) -> dict:
         return await self._req("GET", "/health")
@@ -61,8 +95,10 @@ class BackendClient:
     async def dashboard(self, events_after: int = 0) -> dict:
         return await self._req("GET", "/dashboard", params={"events_after": events_after})
 
-    async def approve(self, action_id: int) -> dict:
-        return await self._req("POST", f"/actions/{action_id}/approve")
+    async def approve(self, action_id: int, payload_digest: str | None = None) -> dict:
+        """`payload_digest` binds the approval to the draft the reviewer saw (409 if it changed)."""
+        body = {"payload_digest": payload_digest} if payload_digest else None
+        return await self._req("POST", f"/actions/{action_id}/approve", json=body)
 
     async def reject(self, action_id: int) -> dict:
         return await self._req("POST", f"/actions/{action_id}/reject")
@@ -73,9 +109,16 @@ class BackendClient:
     async def retry(self, email_id: str) -> dict:
         return await self._req("POST", f"/emails/{email_id}/retry")
 
+    async def reopen(self, action_id: int) -> dict:
+        """Failed execution that never reached the API -> back to pending for review."""
+        return await self._req("POST", f"/actions/{action_id}/reopen")
+
 
 def _detail(r: httpx.Response) -> str:
     try:
-        return str(r.json().get("detail", r.text))
+        body = r.json()
     except ValueError:
         return r.text or r.reason_phrase
+    if isinstance(body, dict) and "detail" in body:
+        return str(body["detail"])
+    return r.text or r.reason_phrase

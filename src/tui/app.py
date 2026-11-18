@@ -3,7 +3,7 @@
     uv run python -m src.tui [--backend URL] [--user NAME]
 
 Keys: / filter · space mark · ctrl+a mark all · x unmark · a/r approve/reject (marked or current) ·
-e edit · t retry failed · [ ] panel width · { } log height (or drag the splitters) ·
+e edit · t retry failed (reopen a failed send) · [ ] panel width · { } log height (or drag the splitters) ·
 d toggle details panel · Enter scroll details (Esc back) ·
 l log out · q quit
 """
@@ -22,6 +22,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from textual import events, on, work
+from textual.worker import get_current_worker
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message
@@ -34,7 +35,19 @@ from textual.widgets import (
 
 from src.tui.filtering import compile_query
 from src.tui.safety import LEVELS, assess
-from src.tui.client import BackendClient, BackendError, Disconnected, Unauthorized
+
+# Workaround for a Textual 8.2.8 crash: rapid right-clicks on a toast that is being
+# dismissed start a text selection whose container is already detached
+# (AttributeError: 'NoneType' object has no attribute 'region' in Screen._forward_event).
+# Toasts have nothing worth selecting, so opting them out skips that code path.
+try:
+    from textual.widgets._toast import Toast as _Toast
+
+    _Toast.ALLOW_SELECT = False
+except ImportError:  # private module moved in a future Textual; the workaround is optional
+    pass
+from src.triage_skill import payload_digest
+from src.tui.client import BackendClient, BackendError, Disconnected, Unauthorized, check_backend_url
 from src.tui.profile import Profile, config_path
 
 EDITABLE = {  # mirrors triage_skill.EDITABLE_FIELDS; the backend is the enforcer
@@ -54,6 +67,15 @@ def safety_cell(r: dict) -> Text:
 def _short(text: str | None, n: int = 60) -> str:
     text = (text or "").replace("\n", " ")
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def cell(value: object, default: str = "") -> Text:
+    """DataTable cell for untrusted text: a plain Text, never parsed as markup
+    (a str cell containing e.g. "[/]" raises MarkupError and kills the table)."""
+    return value if isinstance(value, Text) else Text(default if value in (None, "") else str(value))
+
+
+DRAFT_CHANGED = "draft changed since you viewed it"
 
 
 # -- connect / login ------------------------------------------------------------
@@ -92,12 +114,15 @@ class ConnectScreen(Screen):
         if not (url and user and pw):
             status.update("[yellow]URL, username and password are required.[/]")
             return
-        status.update(f"checking {url}/health …")
+        if problem := check_backend_url(url):  # before anything (credentials) is sent
+            status.update(Text(problem, style="red"))
+            return
+        status.update(Text(f"checking {url}/health …"))
         client = BackendClient(url)
         try:
             health = await client.health()
-            if health.get("status") != "ok":
-                status.update(f"[yellow]backend reachable but degraded: {health}[/]")
+            if not isinstance(health, dict) or health.get("status") != "ok":
+                status.update(Text(f"backend reachable but degraded: {health}", style="yellow"))
                 await client.aclose()
                 return
             await client.login(user, pw)
@@ -108,10 +133,16 @@ class ConnectScreen(Screen):
             return
         except BackendError as exc:
             await client.aclose()
-            status.update(f"[red]{exc}[/]")
+            if exc.status == 503:  # /health answers 503 when e.g. the database is down
+                status.update(Text(f"backend reachable but degraded: {exc}", style="yellow"))
+            else:
+                status.update(Text(str(exc), style="red"))
             return
         self.app.profile.backend_url, self.app.profile.username = url, user
-        self.app.profile.save()
+        try:
+            self.app.profile.save()
+        except OSError as exc:  # read-only/full config dir: still log in, just don't remember
+            self.notify(escape(f"could not save profile: {exc}"), severity="warning")
         await self.app.set_client(client)
         self.app.switch_screen(DashboardScreen())
 
@@ -134,7 +165,7 @@ class EditScreen(ModalScreen[dict | None]):
         with Vertical(id="edit"):
             dest = payload_dest(self.kind, self.payload)
             verb = "creates" if self.kind == "create_lead" else "goes to"
-            yield Label(f"[b]Edit {self.kind}[/b]: {verb} {escape(dest)} (fixed, not editable)")
+            yield Label(f"[b]Edit {escape(self.kind)}[/b]: {verb} {escape(dest)} (fixed, not editable)")
             for f in EDITABLE[self.kind]:
                 yield Label(f)
                 value = self.payload.get(f) or ""
@@ -232,13 +263,21 @@ def render_detail(row: dict) -> Group:
 
 
     if row.get("payload"):  # a pending action in "Needs approval"
-        title = f"Proposed {KIND_NAME.get(row['kind'], row['kind'])}" + (" (+extra)" if row.get("extra") else "")
+        title = f"{'Failed' if row.get('row_type') == 'exec_failed' else 'Proposed'} {KIND_NAME.get(row['kind'], row['kind'])}" + (" (+extra)" if row.get("extra") else "")
         parts += [Text(""), _section(title)]
         if row.get("extra"):
             parts.append(Text("Suggested beyond the standard routing for this label: "
                               + (row.get("rationale") or "").removeprefix("extra: "), style="cyan"))
         parts += _payload_parts(row["kind"], row["payload"])
-        parts += [Text(""), Text("a approve · r reject · e edit", style="italic bright_black")]
+        if row.get("row_type") == "exec_failed":
+            parts += [Text(""), _section("Execution failed"),
+                      _fields(("Status", Text(str(row.get("action_status") or "failed"), style="bold red")),
+                              ("Error", Text(str(row.get("action_error") or "unknown error"), style="red"))),
+                      Text("The write never reached the API, so it is safe to retry: t reopens it as a "
+                           "pending draft to review and approve again.", style="cyan"),
+                      Text(""), Text("t reopen", style="italic bright_black")]
+        else:
+            parts += [Text(""), Text("a approve · r reject · e edit", style="italic bright_black")]
     for act in row.get("actions") or []:  # history: what happened to each action
         status = Text(act["status"], style=STATUS_STYLE.get(act["status"], ""))
         if act.get("decided_by"):
@@ -267,6 +306,38 @@ def fmt_ts(value: str | None) -> str:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
     except ValueError:
         return value[:16]
+
+
+# Row builders: every value from the backend goes through `cell` (plain Text, no markup).
+def approval_row(r: dict, marked: set[str] = frozenset()) -> tuple[str, tuple]:
+    ts = cell(fmt_ts(r.get("received_at")))
+    if r["row_type"] == "failed":
+        return f"f:{r['email_id']}", (safety_cell(r), cell(""), ts, cell(r["email_id"]), cell(r["sender"]), cell("?"),
+                                       Text("FAILED (t=retry)", style="bold red"), cell("-"), cell(_short(r["last_error"])))
+    p = r.get("payload") or {}
+    preview = p.get("body") or p.get("message") or p.get("summary")
+    kind = cell(r["kind"]) + (Text(" +extra", style="bold cyan") if r.get("extra") else Text(""))
+    if r["row_type"] == "exec_failed":
+        return f"x:{r['action_id']}", (safety_cell(r), cell(""), ts, cell(r["email_id"]), cell(r["sender"]),
+                                        cell(r.get("label"), "-"), Text("SEND FAILED (t=reopen)", style="bold red"),
+                                        cell(payload_dest(r["kind"], p)), cell(_short(r.get("action_error"), 50)))
+    key = f"a:{r['action_id']}"
+    mark = Text("☑", style="bold green") if key in marked else Text("☐", style="dim")
+    return key, (safety_cell(r), mark, ts, cell(r["email_id"]), cell(r["sender"]), cell(r["label"]), kind,
+                 cell(payload_dest(r["kind"], p)), cell(_short(preview, 50)))
+
+
+def working_row(r: dict) -> tuple[str, tuple]:
+    return r["email_id"], (safety_cell(r), cell(fmt_ts(r.get("received_at"))), cell(r["email_id"]), cell(r["sender"]),
+                           cell(_short(r["subject"], 40)), cell(r["status"]), cell(r["attempts"]),
+                           cell(_short(r["last_error"], 40)))
+
+
+def history_row(r: dict) -> tuple[str, tuple]:
+    actions = ", ".join(f"{a['kind']}{'+' if a.get('extra') else ''}:{a['status']}" for a in r["actions"])
+    return r["email_id"], (safety_cell(r), cell(fmt_ts(r.get("received_at"))), cell(fmt_ts(r.get("updated_at"))),
+                           cell(r["email_id"]), cell(r["sender"]), cell(r["label"], "-"), cell(r["status"]),
+                           cell(actions, "-"), cell(_short(r["subject"], 40)))
 
 
 class Splitter(Widget):
@@ -403,6 +474,7 @@ class DashboardScreen(Screen):
         self._seen_first_batch = False
         self._detail_key: tuple[str, str | None] | None = None
         self._detail_text = ""
+        self._refreshing: object | None = None  # the refresh worker currently in flight
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -438,7 +510,7 @@ class DashboardScreen(Screen):
         c = self.app.client
         self.app.title = f"Inbox Triage · {c.username}@{c.base_url}"
         self.style_detail_panel()
-        self.set_interval(p.refresh_s, self.refresh_data)
+        self.set_interval(p.refresh_s, self._tick)
         self.refresh_data()
         self._focus_table()
 
@@ -447,8 +519,24 @@ class DashboardScreen(Screen):
         return self.app.client
 
     # -- data ---------------------------------------------------------------
+    def _tick(self) -> None:
+        # A slow request (> refresh interval) must finish rather than be cancelled by
+        # the next tick (exclusive=True would restart it forever and leave the table empty).
+        if self._refreshing is None:
+            self.refresh_data()
+
     @work(exclusive=True, group="refresh")
     async def refresh_data(self) -> None:
+        # An explicit refresh (after approve etc.) may still replace an older one;
+        # only the worker that is current clears the flag.
+        self._refreshing = me = get_current_worker()
+        try:
+            await self._refresh_once()
+        finally:
+            if self._refreshing is me:
+                self._refreshing = None
+
+    async def _refresh_once(self) -> None:
         try:
             data = await self.client.dashboard(self._last_event)
         except Unauthorized:
@@ -458,6 +546,8 @@ class DashboardScreen(Screen):
             return
         except BackendError as exc:
             self.sub_title = f"⚠ {exc} (retrying)"
+            return
+        if self.app.client is None:  # logged out while the request was in flight
             return
         log = self.query_one("#log", RichLog)
         new_mail = []
@@ -488,28 +578,9 @@ class DashboardScreen(Screen):
         live = {f"a:{r['action_id']}" for r in data["approvals"] if r["row_type"] == "action"}
         self._marked &= live  # decided elsewhere (or by us) -> drop the mark
 
-        def a_row(r):
-            ts = fmt_ts(r.get("received_at"))
-            if r["row_type"] == "failed":
-                return f"f:{r['email_id']}", (safety_cell(r), "", ts, r["email_id"], r["sender"], "?",
-                                               "FAILED (t=retry)", "-", _short(r["last_error"]))
-            key = f"a:{r['action_id']}"
-            p = r["payload"]
-            preview = p.get("body") or p.get("message") or p.get("summary")
-            mark = Text("☑", style="bold green") if key in self._marked else Text("☐", style="dim")
-            kind = Text(r["kind"]) + (Text(" +extra", style="bold cyan") if r.get("extra") else Text(""))
-            return key, (safety_cell(r), mark, ts, r["email_id"], r["sender"], r["label"], kind,
-                         payload_dest(r["kind"], p), _short(preview, 50))
-
-        self._fill("approvals", data["approvals"], a_row)
-        self._fill("working", data["working"], lambda r: (r["email_id"], (
-            safety_cell(r), fmt_ts(r.get("received_at")), r["email_id"], r["sender"], _short(r["subject"], 40),
-            r["status"], str(r["attempts"]), _short(r["last_error"], 40))))
-        self._fill("history", data["history"], lambda r: (r["email_id"], (
-            safety_cell(r), fmt_ts(r.get("received_at")), fmt_ts(r.get("updated_at")), r["email_id"], r["sender"],
-            r["label"] or "-", r["status"],
-            ", ".join(f"{a['kind']}{'+' if a.get('extra') else ''}:{a['status']}" for a in r["actions"]) or "-",
-            _short(r["subject"], 40))))
+        self._fill("approvals", data["approvals"], lambda r: approval_row(r, self._marked))
+        self._fill("working", data["working"], working_row)
+        self._fill("history", data["history"], history_row)
 
         tabs = self.query_one(TabbedContent)
         names = {"approvals": "Needs approval", "working": "Queue / working", "history": "History"}
@@ -522,6 +593,7 @@ class DashboardScreen(Screen):
         self._show_detail()
 
     def _fill(self, name: str, rows: list[dict], to_row) -> None:
+        # Cells are Text (see `cell`); change detection compares their plain text.
         table = self.query_one(f"#t-{name}", DataTable)
         self._totals[name] = len(rows)
         pairs = [(to_row(r), r) for r in rows if self._match(r)]
@@ -677,6 +749,10 @@ class DashboardScreen(Screen):
         tab, key, row = self._selected()
         if tab == "approvals" and key and key.startswith("a:"):
             return row
+        if tab == "approvals" and key and key.startswith("x:"):
+            self.notify("This send failed. Press t to reopen it as a pending draft, then review and approve it again.",
+                        severity="warning")
+            return None
         self.notify("Select a proposed action in 'Needs approval'.", severity="warning")
         return None
 
@@ -687,14 +763,19 @@ class DashboardScreen(Screen):
     async def _call(self, label: str, coro) -> bool:
         try:
             await coro
-            self.notify(label)
+            self.notify(escape(label))
             return True
         except Unauthorized:
             self.refresh_data()  # handles the redirect to login
         except Disconnected as exc:
-            self.notify(str(exc), severity="error")
+            self.notify(escape(str(exc)), severity="error")
         except BackendError as exc:
-            self.notify(f"{label} failed: {exc}", severity="error", timeout=8)
+            if _draft_changed(exc):
+                self.notify(escape(f"{label} NOT done: the draft was changed since you viewed it. "
+                                   "Review the updated draft and approve again."),
+                            title="Draft changed", severity="warning", timeout=10)
+            else:
+                self.notify(escape(f"{label} failed: {exc}"), severity="error", timeout=8)
         return False
 
     async def _bulk(self, verb: str, rows: list[dict]) -> None:
@@ -708,22 +789,34 @@ class DashboardScreen(Screen):
                 body.append(f"  {sf.icon} {r['email_id']} ({r['kind']}): {sf.worst.name}\n", style=sf.style)
         if not await self.app.push_screen_wait(ConfirmScreen(f"{verb.capitalize()} {len(rows)} marked action(s)?", body)):
             return
-        call = self.client.approve if verb == "approve" else self.client.reject
-        done = failed = 0
+        done = failed = changed = 0
         for r in rows:  # sequential: each approval is its own audited, atomic transition
             try:
-                await call(r["action_id"])
+                if verb == "approve":  # bound to the draft shown when the reviewer marked/confirmed it
+                    await self.client.approve(r["action_id"], payload_digest(r["payload"]))
+                else:
+                    await self.client.reject(r["action_id"])
                 done += 1
             except Unauthorized:
                 self.refresh_data()
                 return
             except BackendError as exc:
-                failed += 1
-                self.query_one("#log", RichLog).write(f"bulk {verb} {r['email_id']} {r['kind']} failed: {exc}")
+                if _draft_changed(exc):
+                    changed += 1
+                    self.query_one("#log", RichLog).write(
+                        f"bulk {verb} {r['email_id']} {r['kind']} skipped: draft changed since you viewed it")
+                else:
+                    failed += 1
+                    self.query_one("#log", RichLog).write(f"bulk {verb} {r['email_id']} {r['kind']} failed: {exc}")
             self._marked.discard(f"a:{r['action_id']}")
         past = "approved" if verb == "approve" else "rejected"
-        self.notify(f"{past} {done}" + (f", {failed} failed (see log)" if failed else ""),
-                    severity="error" if failed else "information")
+        msg = f"{past} {done}"
+        if changed:
+            msg += f", {changed} not approved because the draft changed (review again)"
+        if failed:
+            msg += f", {failed} failed (see log)"
+        self.notify(msg, severity="error" if failed else "warning" if changed else "information",
+                    timeout=10 if changed or failed else 5)
         self.refresh_data()
 
     @work(exclusive=True, group="act")
@@ -740,7 +833,9 @@ class DashboardScreen(Screen):
                 body.append("\nRead the draft and the original email before approving.", style="italic")
                 if not await self.app.push_screen_wait(ConfirmScreen(f"{sf.icon} Approve despite safety warning?", body)):
                     return
-            await self._call(f"approved {row['kind']} for {row['email_id']}", self.client.approve(row["action_id"]))
+            # Digest of the payload this row displayed: the backend refuses (409) if it was edited since.
+            await self._call(f"approved {row['kind']} for {row['email_id']}",
+                             self.client.approve(row["action_id"], payload_digest(row["payload"])))
             self.refresh_data()
 
     @work(exclusive=True, group="act")
@@ -762,9 +857,13 @@ class DashboardScreen(Screen):
 
     @work(exclusive=True, group="act")
     async def action_retry(self) -> None:
-        tab, key, _ = self._selected()
+        tab, key, row = self._selected()
         if tab == "approvals" and key and key.startswith("f:"):
             await self._call(f"re-queued {key[2:]}", self.client.retry(key[2:]))
+            self.refresh_data()
+        elif tab == "approvals" and key and key.startswith("x:") and row:
+            await self._call(f"reopened {row['kind']} for {row['email_id']}: review and approve it again",
+                             self.client.reopen(row["action_id"]))
             self.refresh_data()
         else:
             self.notify("Select a FAILED row to retry.", severity="warning")
@@ -773,6 +872,10 @@ class DashboardScreen(Screen):
     async def action_logout(self) -> None:
         await self.app.drop_client(logout=True)
         self.app.switch_screen(ConnectScreen())
+
+
+def _draft_changed(exc: BackendError) -> bool:
+    return exc.status == 409 and DRAFT_CHANGED in str(exc)
 
 
 # -- app -----------------------------------------------------------------------------
